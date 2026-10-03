@@ -1,0 +1,125 @@
+#!/bin/zsh
+# n8n — read-only live-state queries against an n8n Cloud instance.
+#
+# WHY THIS EXISTS: in production, every significant finding comes from reading
+# LIVE state, and almost none from reading notes. Notes said a workflow was
+# paused when it was still sending; notes said an endpoint was fine when it had
+# been returning 404 for weeks. The same curl+jq incantation got rebuilt from
+# scratch about eight times in a single day of debugging. Making the check cheap
+# is what makes the check actually happen.
+#
+# READ-ONLY BY DESIGN. No subcommand mutates anything. Publishing, editing and
+# activating deliberately live elsewhere, where they are visible and reviewable.
+# A tool that can only look is a tool you can run without thinking about it.
+#
+# SETUP
+#   export N8N_BASE="https://<your-instance>.app.n8n.cloud"   # or self-hosted
+#   echo '<your api key>' > ~/.n8n-api-key && chmod 600 ~/.n8n-api-key
+#
+# Absolute binary paths are intentional: PATH is not dependable in a hook shell.
+
+set -o pipefail
+CURL=/usr/bin/curl; JQ=/usr/bin/jq
+
+: "${N8N_BASE:?set N8N_BASE, e.g. https://your-instance.app.n8n.cloud}"
+BASE="${N8N_BASE%/}/api/v1"
+KEY=$(/bin/cat "${N8N_API_KEY_FILE:-$HOME/.n8n-api-key}" 2>/dev/null | /usr/bin/tr -d '\n')
+[[ -z "$KEY" ]] && { print -u2 "no api key (expected in ~/.n8n-api-key)"; exit 1 }
+api() { $CURL -s --max-time 25 -H "X-N8N-API-KEY: $KEY" "$BASE$1" }
+
+case "$1" in
+
+  ls|workflows)   # [filter] — every workflow, optionally name-filtered
+    api "/workflows?limit=250" | $JQ -r --arg q "${2:-}" '
+      .data[] | select($q=="" or (.name|ascii_downcase|contains($q|ascii_downcase)))
+      | "\(if .active then "● live " else "○ off  " end) \(.id)  \(.name)"' | /usr/bin/sort
+    ;;
+
+  wf)             # <id> — one workflow: is the DB in sync, are creds bound
+    api "/workflows/$2" | $JQ -r '
+      "name        : \(.name)",
+      "active      : \(.active)",
+      "nodes       : \(.nodes|length)   credentialed: \([.nodes[]|select(.credentials)]|length)",
+      "webhooks    : \([.nodes[]|select(.type=="n8n-nodes-base.webhook")|.parameters.path]|join(", "))",
+      "errorWorkflow: \(.settings.errorWorkflow // "NONE — failures alert nowhere")",
+      "updatedAt   : \(.updatedAt)",
+      "",
+      "nodes:", (.nodes[] | "  \(if .disabled then "[off] " else "" end)\(.name)  <\(.type|split(".")|last)>")'
+    ;;
+
+  node)           # <id> <node name> — dump one node's parameters (the deep check)
+    api "/workflows/$2" | $JQ -r --arg n "$3" '.nodes[] | select(.name==$n) | .parameters'
+    ;;
+
+  execs)          # <id> [n] — recent runs, newest first
+    api "/executions?workflowId=$2&limit=${3:-10}" | $JQ -r '
+      .data[] | "\(.startedAt[0:16])  \(.status | (. + "        ")[0:8])  \(.id)"'
+    ;;
+
+  exec)           # <execId> — one run: where it stopped, and why
+    api "/executions/$2?includeData=true" | $JQ -r '
+      "status: \(.status)   started: \(.startedAt)   stopped: \(.stoppedAt // "—")",
+      "last node executed: \(.data.resultData.lastNodeExecuted // "?")",
+      "error: \(.data.resultData.error.message // "none")"'
+    ;;
+
+  errors)         # [days] — failures grouped by workflow. Bounded, or one dead
+                  # workflow shouts forever and drowns every other signal.
+    # Compare ISO strings, do NOT parse. n8n returns fractional seconds
+    # ("2026-09-21T16:30:00.097Z") and jq's fromdateiso8601 CANNOT parse that —
+    # it throws. The common defensive idiom
+    #     (.startedAt // "" | fromdateiso8601? // 0) > $cut
+    # then does the worst possible thing: `?` swallows the throw, `// 0` makes
+    # every timestamp 0, and `0 > $cut` is always false — so the filter drops
+    # EVERY row and the check reports a clean result forever. This subcommand
+    # carried that bug from the day it was written and never once reported a
+    # failing workflow, while several were failing weekly. It looked healthy,
+    # because "no failures" is exactly what a working monitor prints on a good day.
+    # Lexicographic comparison on ISO-8601 UTC is exact, total, and cannot throw.
+    api "/executions?status=error&limit=200" | $JQ -r --arg d "${2:-3}" '
+      ((now - ($d|tonumber)*86400) | todate) as $cut
+      | [.data[] | select((.startedAt // "") > $cut) | .workflowId]
+      | group_by(.) | map({id:.[0], n:length}) | sort_by(-.n)
+      | if length==0 then "no failures in the last \($d) day(s)"
+        else .[] | "\(.n)x  \(.id)" end'
+    ;;
+
+  webhooks)       # every registered webhook path and whether it is live
+    api "/workflows?limit=250" | $JQ -r '
+      .data[] | . as $w | (.nodes//[])[] | select(.type=="n8n-nodes-base.webhook")
+      | "\(if $w.active then "● live " else "○ off  " end) /\(.parameters.path)   ← \($w.name)"' | /usr/bin/sort
+    ;;
+
+  waiting)        # parked executions — "paused" is not "stopped" until this is empty
+    api "/executions?status=waiting&limit=100" | $JQ -r '
+      if (.data|length)==0 then "none parked — nothing can still send"
+      else .data[] | "\(.startedAt[0:16])  wf \(.workflowId)  exec \(.id)" end'
+    ;;
+
+  probe)          # <path> — zero-side-effect liveness check on a production webhook.
+                  # A GET tells you whether the RUNTIME registered the path:
+                  #   "is not registered"              -> dead
+                  #   "not registered for GET requests" -> live (method rejected only)
+                  # No execution starts, nothing is enrolled, nothing is sent.
+    $CURL -s --max-time 15 "${N8N_BASE%/}/webhook/$2" | $JQ -r '.message // .' 2>/dev/null \
+      || print "no response"
+    ;;
+
+  *)
+    /bin/cat <<'USAGE'
+n8n — read-only live state (no subcommand mutates anything)
+
+  n8n ls [filter]        every workflow, ● live / ○ off
+  n8n wf <id>            one workflow: active, nodes, creds, webhooks, errorWorkflow
+  n8n node <id> <name>   dump a node's parameters
+  n8n execs <id> [n]     recent runs
+  n8n exec <execId>      one run: last node executed + error
+  n8n errors [days]      failures grouped by workflow (default 3 days)
+  n8n webhooks           every registered path + whether it is live
+  n8n waiting            parked executions — a pause is not a stop until this is empty
+  n8n probe <path>       is a production webhook registered? (zero side effects)
+
+env: N8N_BASE (required), N8N_API_KEY_FILE (default ~/.n8n-api-key)
+USAGE
+    ;;
+esac
